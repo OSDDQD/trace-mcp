@@ -182,6 +182,27 @@ function readLastStat(traceHome: string, timeoutMs = 10_000): Record<string, unk
   }
 }
 
+/**
+ * Real curl under `-w '%{http_code} %{time_connect}'` when `--max-time` fires:
+ * prints "000 <time_connect>" and exits 28. A non-zero time_connect means the
+ * TCP connect to the daemon succeeded before the timeout (#1480).
+ */
+function makeTimeoutCurlStub(stubDir: string, timeConnect: string): string {
+  fs.mkdirSync(stubDir, { recursive: true });
+  const stubPath = path.join(stubDir, 'curl');
+  fs.writeFileSync(stubPath, `#!/usr/bin/env bash\necho "000 ${timeConnect}"\nexit 28\n`);
+  fs.chmodSync(stubPath, 0o755);
+  return stubPath;
+}
+
+/** trace-mcp stub that leaves a marker file when the hook spawns it. */
+function makeRecordingTraceMcpStub(stubDir: string, marker: string): string {
+  const stubPath = path.join(stubDir, 'trace-mcp');
+  fs.writeFileSync(stubPath, `#!/usr/bin/env bash\ntouch "${marker}"\nexit 0\n`);
+  fs.chmodSync(stubPath, 0o755);
+  return stubPath;
+}
+
 function makeTraceMcpStub(stubDir: string): string {
   const stubPath = path.join(stubDir, 'trace-mcp');
   fs.writeFileSync(stubPath, '#!/usr/bin/env bash\nexit 0\n');
@@ -319,6 +340,45 @@ describe.skipIf(process.platform === 'win32')('trace-mcp-reindex.sh stats writer
     expectCleanExit(res);
 
     const parsed = readLastStat(traceHome);
+    expect(parsed.reason).toBe('no-daemon');
+  });
+
+  it('records a timeout after a successful connect as daemon/timeout without a CLI fallback (#1480)', () => {
+    // A live daemon that outran `--max-time` still has the request. Treating
+    // it as no-daemon spawned a cold `index-file` for every edit on large
+    // projects and reported a healthy daemon as unreachable.
+    makeTimeoutCurlStub(stubDir, '0.000150');
+    const marker = path.join(tmpRoot, 'cli-spawned');
+    makeRecordingTraceMcpStub(stubDir, marker);
+    const filePath = path.join(projectDir, 'src', 'foo.ts');
+    const res = runHook({
+      cwd: projectDir,
+      stubDir,
+      traceHome,
+      stdin: JSON.stringify({ tool_name: 'Edit', tool_input: { file_path: filePath } }),
+    });
+    expectCleanExit(res);
+
+    const parsed = readLastStat(traceHome);
+    expect(parsed.path).toBe('daemon');
+    expect(parsed.reason).toBe('timeout');
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('still falls back when the connect itself timed out (#1480)', () => {
+    makeTimeoutCurlStub(stubDir, '0.000000');
+    makeTraceMcpStub(stubDir);
+    const filePath = path.join(projectDir, 'src', 'foo.ts');
+    const res = runHook({
+      cwd: projectDir,
+      stubDir,
+      traceHome,
+      stdin: JSON.stringify({ tool_name: 'Edit', tool_input: { file_path: filePath } }),
+    });
+    expectCleanExit(res);
+
+    const parsed = readLastStat(traceHome);
+    expect(parsed.path).toBe('cli');
     expect(parsed.reason).toBe('no-daemon');
   });
 

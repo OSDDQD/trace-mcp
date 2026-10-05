@@ -25,7 +25,14 @@ export interface ReindexFileRequest {
 }
 
 export type ReindexFileResult =
-  | { ok: true; relPath: string; skippedRecent?: boolean; skippedChurn?: boolean }
+  | {
+      ok: true;
+      relPath: string;
+      skippedRecent?: boolean;
+      skippedChurn?: boolean;
+      /** #1480: accepted into the per-project queue; indexing has not run yet. */
+      queued?: boolean;
+    }
   | { ok: false; status: 400 | 404 | 500; error: string }
   | { ok: false; status: 503; error: string; retryAfterSec: number };
 
@@ -105,26 +112,90 @@ export interface ReindexFileDeps {
     | undefined;
   /** Override withLock for tests. */
   lock?: typeof withLock;
+  /** Override the queued-reindex lock retry schedule for tests (#1480). */
+  queueRetry?: { delayMs: number; deadlineMs: number };
 }
+
+type ManagedReindexTarget = NonNullable<ReturnType<ReindexFileDeps['getProject']>>;
+
+/** Outcome of the synchronous, pre-lock half of a reindex-file request. */
+type PreparedReindexFile =
+  | { kind: 'done'; result: ReindexFileResult }
+  | {
+      kind: 'run';
+      project: string;
+      rel: string;
+      managed: ManagedReindexTarget;
+      startedAt: number;
+    };
 
 /**
  * Validate, resolve, and dispatch a single-file reindex against a managed
- * project. Shares the `<projectHash>-reindex` lock with `register_edit` so the
- * HTTP path and the MCP path serialize on the same SQLite writer.
+ * project, and answer only once the indexing has finished. Shares the
+ * `<projectHash>-reindex` lock with `register_edit` so the HTTP path and the
+ * MCP path serialize on the same SQLite writer.
+ *
+ * The HTTP route uses this only when the caller asks for the result
+ * (`?wait=1`); the PostToolUse hook and `trace-mcp index-file` go through
+ * {@link acceptReindexFile}, which answers before the work runs (#1480).
  */
 export async function handleReindexFile(
   body: Partial<ReindexFileRequest> | undefined,
   deps: ReindexFileDeps,
 ): Promise<ReindexFileResult> {
+  const prepared = prepareReindexFile(body, deps);
+  if (prepared.kind === 'done') return prepared.result;
+  return runReindexFile(prepared, deps);
+}
+
+/**
+ * Validate a reindex-file request and queue the indexing instead of waiting
+ * for it (#1480). Validation, the 404/503 answers and the churn/recent
+ * fast paths are identical to {@link handleReindexFile}; a request that
+ * passes them is added to the project's pending set and the call returns
+ * `{ ok: true, queued: true }` synchronously.
+ *
+ * WHY: the response used to be written only after `indexFiles()` — including
+ * project-wide edge resolution — had finished. On a ~27k-symbol PHP project
+ * that is ~2.4 s per file, so nearly every edit outran the hook's 2 s curl
+ * timeout on a healthy daemon, got recorded as `no-daemon`, and spawned a
+ * cold `trace-mcp index-file` that indexed the same file again (sometimes
+ * locally, as a second SQLite writer). Nothing on the hook path consumes the
+ * result, so the wait bought nothing.
+ *
+ * The queue drains under the same `<projectHash>-reindex` lock, coalesces
+ * paths that arrive while a run is in flight into the next batch, retries
+ * lock contention instead of dropping the edit, and holds the in-flight mark
+ * until it is empty so `stopProject()` still drains it before closing the DB.
+ */
+export function acceptReindexFile(
+  body: Partial<ReindexFileRequest> | undefined,
+  deps: ReindexFileDeps,
+): ReindexFileResult {
+  const prepared = prepareReindexFile(body, deps);
+  if (prepared.kind === 'done') return prepared.result;
+  enqueueReindex(prepared.project, prepared.rel, prepared.startedAt, deps);
+  return { ok: true, relPath: prepared.rel, queued: true };
+}
+
+/**
+ * The synchronous half shared by both entry points: request validation,
+ * project lookup and readiness, path confinement, and the churn / recent
+ * fast paths. Everything here runs before the reindex lock is touched.
+ */
+function prepareReindexFile(
+  body: Partial<ReindexFileRequest> | undefined,
+  deps: ReindexFileDeps,
+): PreparedReindexFile {
   const startedAt = performance.now();
   const project = body?.project;
   const rawPath = body?.path;
 
   if (typeof project !== 'string' || project.length === 0) {
-    return { ok: false, status: 400, error: 'project is required' };
+    return { kind: 'done', result: { ok: false, status: 400, error: 'project is required' } };
   }
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
-    return { ok: false, status: 400, error: 'path is required' };
+    return { kind: 'done', result: { ok: false, status: 400, error: 'path is required' } };
   }
 
   const managed = deps.getProject(project);
@@ -138,7 +209,10 @@ export async function handleReindexFile(
       { event: 'reindex-file', project, path: rawPath, pathSource: 'http' },
       'reindex-file: project not registered',
     );
-    return { ok: false, status: 404, error: `project not registered: ${project}` };
+    return {
+      kind: 'done',
+      result: { ok: false, status: 404, error: `project not registered: ${project}` },
+    };
   }
 
   // Phase 5.1: if the project is still warming (cold daemon, indexAll in
@@ -146,10 +220,13 @@ export async function handleReindexFile(
   // the local CLI path until the daemon finishes warming.
   if (managed.status !== undefined && managed.status !== 'ready') {
     return {
-      ok: false,
-      status: 503,
-      error: `project not ready: ${managed.status}`,
-      retryAfterSec: 5,
+      kind: 'done',
+      result: {
+        ok: false,
+        status: 503,
+        error: `project not ready: ${managed.status}`,
+        retryAfterSec: 5,
+      },
     };
   }
 
@@ -159,10 +236,8 @@ export async function handleReindexFile(
   // Retry-After and fall back to the local CLI path transparently.
   if (isProjectStopping(project)) {
     return {
-      ok: false,
-      status: 503,
-      error: 'project is stopping',
-      retryAfterSec: 5,
+      kind: 'done',
+      result: { ok: false, status: 503, error: 'project is stopping', retryAfterSec: 5 },
     };
   }
 
@@ -183,11 +258,17 @@ export async function handleReindexFile(
       realRoot = fs.realpathSync(projectRoot);
       realInput = fs.realpathSync(normalized);
     } catch {
-      return { ok: false, status: 400, error: 'path is outside project root' };
+      return {
+        kind: 'done',
+        result: { ok: false, status: 400, error: 'path is outside project root' },
+      };
     }
     relRaw = path.relative(realRoot, realInput);
     if (relRaw.startsWith('..') || path.isAbsolute(relRaw)) {
-      return { ok: false, status: 400, error: 'path is outside project root' };
+      return {
+        kind: 'done',
+        result: { ok: false, status: 400, error: 'path is outside project root' },
+      };
     }
   }
   const rel = path.sep === '\\' ? relRaw.split('\\').join('/') : relRaw;
@@ -223,7 +304,7 @@ export async function handleReindexFile(
       indexed: 0,
       elapsedMs,
     });
-    return { ok: true, relPath: rel, skippedChurn: true };
+    return { kind: 'done', result: { ok: true, relPath: rel, skippedChurn: true } };
   }
 
   // Phase 1.3 dedup: when a single Edit causes both the PostToolUse hook
@@ -252,9 +333,18 @@ export async function handleReindexFile(
       indexed: 0,
       elapsedMs,
     });
-    return { ok: true, relPath: rel, skippedRecent: true };
+    return { kind: 'done', result: { ok: true, relPath: rel, skippedRecent: true } };
   }
 
+  return { kind: 'run', project, rel, managed, startedAt };
+}
+
+/** Run one prepared request under the reindex lock and report its telemetry. */
+async function runReindexFile(
+  prepared: Extract<PreparedReindexFile, { kind: 'run' }>,
+  deps: ReindexFileDeps,
+): Promise<ReindexFileResult> {
+  const { project, rel, managed, startedAt } = prepared;
   const lock = deps.lock ?? withLock;
 
   const endReindex = beginReindex(project);
@@ -370,5 +460,193 @@ export async function handleReindexFile(
     return { ok: false, status: 500, error: String(err) };
   } finally {
     endReindex();
+  }
+}
+
+/** How long a queued batch keeps retrying a busy reindex lock (or a project
+ *  that is not `ready`) before it is dropped with an error record (#1480).
+ *  The lock is held by `register_edit`, a `?wait=1` request or a foreign
+ *  process; each of those finishes in seconds, so this only binds when the
+ *  lock is wedged. */
+export const QUEUED_REINDEX_RETRY_DEADLINE_MS = 30_000;
+/** Pause between lock attempts for a queued batch. */
+export const QUEUED_REINDEX_RETRY_DELAY_MS = 250;
+
+interface PendingReindexQueue {
+  /** Project spelling the requests used — the lock name and logs key off it. */
+  project: string;
+  /** Pending relative paths → when the first request for each was accepted. */
+  paths: Map<string, number>;
+  draining: boolean;
+}
+
+/** Per-project pending queues for {@link acceptReindexFile}. */
+const pendingQueues = new Map<string, PendingReindexQueue>();
+
+function enqueueReindex(
+  project: string,
+  rel: string,
+  acceptedAt: number,
+  deps: ReindexFileDeps,
+): void {
+  const key = keyOf(project);
+  let queue = pendingQueues.get(key);
+  if (!queue) {
+    queue = { project, paths: new Map(), draining: false };
+    pendingQueues.set(key, queue);
+  }
+  if (!queue.paths.has(rel)) queue.paths.set(rel, acceptedAt);
+  if (queue.draining) return; // the running drain picks it up in its next batch
+  queue.draining = true;
+  void drainReindexQueue(queue, deps);
+}
+
+/**
+ * Drain one project's queue batch by batch until it is empty. The in-flight
+ * mark is taken synchronously (this function runs up to its first await
+ * inside `enqueueReindex`), so a `stopProject()` that starts after the 202
+ * was written still waits for the queued work before closing the DB.
+ */
+async function drainReindexQueue(queue: PendingReindexQueue, deps: ReindexFileDeps): Promise<void> {
+  const endReindex = beginReindex(queue.project);
+  try {
+    while (queue.paths.size > 0) {
+      const batch = [...queue.paths.entries()];
+      queue.paths.clear();
+      try {
+        await runQueuedBatch(queue.project, batch, deps);
+      } catch (err) {
+        // runQueuedBatch reports its own failures; this only guards the loop.
+        logger.error(
+          { event: 'reindex-file', project: queue.project, err, error: String(err) },
+          'reindex-file queue drain failed',
+        );
+      }
+    }
+  } finally {
+    queue.draining = false;
+    if (queue.paths.size === 0) pendingQueues.delete(keyOf(queue.project));
+    endReindex();
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runQueuedBatch(
+  project: string,
+  batch: Array<[string, number]>,
+  deps: ReindexFileDeps,
+): Promise<void> {
+  const rels = batch.map(([rel]) => rel);
+  const firstAcceptedAt = batch.reduce((min, [, at]) => (at < min ? at : min), Infinity);
+  const lock = deps.lock ?? withLock;
+  const delayMs = deps.queueRetry?.delayMs ?? QUEUED_REINDEX_RETRY_DELAY_MS;
+  const deadline =
+    performance.now() + (deps.queueRetry?.deadlineMs ?? QUEUED_REINDEX_RETRY_DEADLINE_MS);
+  const base = {
+    event: 'reindex-file',
+    project,
+    path: rels[0],
+    ...(rels.length > 1 ? { paths: rels } : {}),
+    batchSize: rels.length,
+    pathSource: 'http',
+    queued: true,
+    skippedRecent: false,
+  };
+  const recordFailure = (): void => {
+    getReindexStats().record({
+      pathSource: 'http',
+      skippedRecent: false,
+      skippedHash: false,
+      indexed: 0,
+      elapsedMs: Math.round(performance.now() - firstAcceptedAt),
+      error: true,
+    });
+  };
+
+  for (;;) {
+    // The project may have been stopped or unloaded since the 202 — its DB is
+    // closing or gone, and a reload re-reads the file from disk anyway.
+    const managed = isProjectStopping(project) ? undefined : deps.getProject(project);
+    if (!managed) {
+      logger.info(
+        { ...base, skippedHash: false, indexed: 0 },
+        'reindex-file queued batch dropped: project stopped or unloaded',
+      );
+      return;
+    }
+    let lockErr: LockError | undefined;
+    if (managed.status === undefined || managed.status === 'ready') {
+      try {
+        const result = (await lock(
+          { lockDir: LOCKS_DIR, name: `${projectHash(project)}-reindex`, op: 'reindex-file-http' },
+          () => managed.pipeline.indexFiles(rels),
+        )) as IndexingResult | undefined;
+        const indexed = result?.indexed ?? 0;
+        const skipped = result?.skipped ?? 0;
+        const skippedHash = indexed === 0 && skipped > 0;
+        // TRA-935: work and wait as two numbers. For a queued batch the wait
+        // runs from the first accepted request, so it includes the time spent
+        // behind the previous batch and any lock retries.
+        const totalMs = Math.round(performance.now() - firstAcceptedAt);
+        const elapsedMs = result?.durationMs ?? totalMs;
+        const queuedMs = Math.max(0, totalMs - elapsedMs);
+        logger.info(
+          { ...base, skippedHash, indexed, elapsedMs, queuedMs },
+          'reindex-file telemetry',
+        );
+        getReindexStats().record({
+          pathSource: 'http',
+          skippedRecent: false,
+          skippedHash,
+          indexed,
+          elapsedMs,
+          queuedMs,
+        });
+        return;
+      } catch (err) {
+        if (!(err instanceof LockError)) {
+          logger.error(
+            {
+              ...base,
+              skippedHash: false,
+              indexed: 0,
+              elapsedMs: Math.round(performance.now() - firstAcceptedAt),
+              err,
+              error: String(err),
+            },
+            'reindex-file telemetry (error)',
+          );
+          recordFailure();
+          return;
+        }
+        lockErr = err;
+      }
+    }
+    // Lock busy or project not ready: the sync path answers 503 and lets the
+    // client retry, but nobody is waiting on a queued request — retry here
+    // instead of silently losing the edit.
+    if (performance.now() + delayMs > deadline) {
+      const holder = lockErr?.holder ?? null;
+      logger.warn(
+        {
+          ...base,
+          skippedHash: false,
+          indexed: 0,
+          elapsedMs: Math.round(performance.now() - firstAcceptedAt),
+          lockBusy: lockErr !== undefined,
+          selfLock: isSelfLock(holder),
+          holderOp: holder?.op,
+          status: managed.status,
+          error: lockErr ? String(lockErr) : `project not ready: ${managed.status}`,
+        },
+        'reindex-file queued batch dropped: retry deadline exceeded',
+      );
+      recordFailure();
+      return;
+    }
+    await sleep(delayMs);
   }
 }
