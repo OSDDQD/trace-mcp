@@ -43,7 +43,7 @@ const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 export const WORKTREE_DELTA_TTL_MS = 2_000;
 
 /** Entries kept in the per-process cache (one per live worktree). */
-const CACHE_MAX_ENTRIES = 64;
+export const WORKTREE_DELTA_CACHE_MAX = 64;
 
 /** Cap on paths listed per category in {@link summarizeWorktreeDelta}. */
 export const WORKTREE_DELTA_SUMMARY_LIMIT = 200;
@@ -84,21 +84,54 @@ export interface WorktreeDeltaSummary {
   note: string;
 }
 
-function isFileSafe(p: string): boolean {
+function realpathSafe(p: string): string {
   try {
-    return fs.statSync(p).isFile();
+    return fs.realpathSync(p);
   } catch {
-    return false;
+    return path.resolve(p);
   }
+}
+
+/**
+ * Walk up from `start` to the first directory holding a `.git` entry. When that
+ * entry is a file and the directory is a linked worktree, return the worktree
+ * root (toplevel) and the main checkout it hangs off; otherwise null. A cwd
+ * inside a subdirectory of a worktree therefore resolves to the same root as the
+ * worktree itself.
+ */
+export function findLinkedWorktree(
+  start: string,
+): { worktreeRoot: string; mainRoot: string } | null {
+  let dir = path.resolve(start);
+  for (let depth = 0; depth < 64; depth++) {
+    let st: fs.Stats | null = null;
+    try {
+      st = fs.statSync(path.join(dir, '.git'));
+    } catch {
+      /* no .git here — keep walking */
+    }
+    if (st) {
+      if (!st.isFile()) return null;
+      const info = detectGitWorktree(dir);
+      if (!info) return null;
+      return { worktreeRoot: realpathSafe(dir), mainRoot: realpathSafe(info.mainRoot) };
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
 }
 
 /**
  * Decide whether a session root is a linked worktree and which checkout
  * serves its index. Reads `.git` metadata directly, no subprocess.
  *
- * `worktreeHint` is the worktree path a stdio proxy forwards when it routed a
- * worktree to a canonical project: the daemon session is then bound to the
- * canonical root, and the worktree identity would otherwise be lost.
+ * `worktreeHint` is the path a stdio proxy forwards when it routed a worktree
+ * to a canonical project: the daemon session is then bound to the canonical
+ * root, and the worktree identity would otherwise be lost. The hint is
+ * untrusted input — it may be any directory inside the worktree, and it is only
+ * honoured when that worktree's main checkout is exactly `sessionRoot`.
  *
  * Returns null for anything that is not a linked worktree (a main checkout, a
  * plain directory) — callers use that to leave the non-worktree path
@@ -109,20 +142,19 @@ export function resolveWorktreeLink(
   worktreeHint?: string | null,
 ): WorktreeLink | null {
   if (worktreeHint) {
-    const worktreeRoot = path.resolve(worktreeHint);
-    if (!isFileSafe(path.join(worktreeRoot, '.git'))) return null;
-    return { worktreeRoot, canonicalRoot: path.resolve(sessionRoot) };
+    const found = findLinkedWorktree(worktreeHint);
+    if (!found || found.mainRoot !== realpathSafe(sessionRoot)) return null;
+    return { worktreeRoot: found.worktreeRoot, canonicalRoot: found.mainRoot };
   }
-  const worktreeRoot = path.resolve(sessionRoot);
-  if (!isFileSafe(path.join(worktreeRoot, '.git'))) return null;
-  const info = detectGitWorktree(worktreeRoot);
-  if (!info) return null;
-  return { worktreeRoot, canonicalRoot: info.mainRoot };
+  const found = findLinkedWorktree(sessionRoot);
+  if (!found) return null;
+  return { worktreeRoot: found.worktreeRoot, canonicalRoot: found.mainRoot };
 }
 
 async function git(cwd: string, args: string[]): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('git', args, {
+    // fsmonitor is a repo-config hook: never let a workspace run one here.
+    const { stdout } = await execFileAsync('git', ['-c', 'core.fsmonitor=false', ...args], {
       cwd,
       encoding: 'utf-8',
       timeout: GIT_TIMEOUT_MS,
@@ -234,13 +266,22 @@ export function getWorktreeDelta(
   const hit = cache.get(key);
   if (hit && now - hit.at < ttlMs) return hit.value;
 
-  if (cache.size >= CACHE_MAX_ENTRIES) {
+  if (cache.size >= WORKTREE_DELTA_CACHE_MAX) {
     for (const [k, v] of cache) {
       if (now - v.at >= ttlMs) cache.delete(k);
     }
-    if (cache.size >= CACHE_MAX_ENTRIES) {
-      const oldest = cache.keys().next().value;
-      if (oldest !== undefined) cache.delete(oldest);
+    if (cache.size >= WORKTREE_DELTA_CACHE_MAX) {
+      // Map order is insertion order and `set` on an existing key keeps its
+      // slot, so evict by the recorded time, not by position.
+      let oldestKey: string | undefined;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [k, v] of cache) {
+        if (v.at < oldestAt) {
+          oldestAt = v.at;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey !== undefined) cache.delete(oldestKey);
     }
   }
   const value = computeWorktreeDelta(link, now).catch(() => null);
@@ -248,9 +289,17 @@ export function getWorktreeDelta(
   return value;
 }
 
+/** One set per computed delta: tool responses are marked on every call. */
+const pathSets = new WeakMap<WorktreeDelta, Set<string>>();
+
 /** All differing paths as one set (modified, deleted and untracked). */
 export function worktreeDeltaPaths(delta: WorktreeDelta): Set<string> {
-  return new Set([...delta.modified, ...delta.deleted, ...delta.untracked]);
+  let set = pathSets.get(delta);
+  if (!set) {
+    set = new Set([...delta.modified, ...delta.deleted, ...delta.untracked]);
+    pathSets.set(delta, set);
+  }
+  return set;
 }
 
 export function worktreeDeltaSize(delta: WorktreeDelta): number {

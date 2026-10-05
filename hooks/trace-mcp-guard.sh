@@ -10,8 +10,8 @@
 #     running" — strict routing off for the whole session.
 #   - The hook now detects a linked worktree (pure bash, reads .git metadata,
 #     no subprocess in a main checkout) and, when no sentinel is found for the
-#     worktree path, falls back to the main checkout's sentinel and
-#     consultation markers.
+#     worktree path (or only a stale one), falls back to the main checkout's
+#     sentinel and consultation markers.
 #   - Read (and Grep with a file path) on a file the worktree changed relative
 #     to the main checkout's HEAD — `git diff --name-only <main HEAD>` plus
 #     untracked files, cached TRACE_MCP_GUARD_WORKTREE_TTL seconds (default 5)
@@ -613,12 +613,29 @@ detect_linked_worktree() {
 }
 
 if detect_linked_worktree && [[ -n "$PROJECT_HASH" ]]; then
-  # Nothing was claimed under the worktree path (the walk keeps a stale match,
-  # so "no sentinel at all" means no server is bound to it): the session is
-  # routed to the main checkout. Borrow its sentinel and consultation markers.
-  if [[ ! -e "$STATUS_HOME/trace-mcp-alive-$PROJECT_HASH" && ! -e "$TMP_HOME/trace-mcp-alive-$PROJECT_HASH" ]]; then
-    WT_MAIN_HASH=$(project_hash_of "$WORKTREE_MAIN_ROOT")
-    if [[ -n "$WT_MAIN_HASH" ]] && [[ -n "$(sentinel_for "$WT_MAIN_HASH")" ]]; then
+  WT_MAIN_HASH=$(project_hash_of "$WORKTREE_MAIN_ROOT")
+  if [[ -n "$WT_MAIN_HASH" && "$WT_MAIN_HASH" == "$PROJECT_HASH" ]]; then
+    # A worktree nested inside its main checkout: the walk up from it lands on
+    # the main root, so the hash is already right — but paths must stay relative
+    # to the worktree, or the marker key (`src/b.ts`) never matches.
+    PROJECT_ROOT="$WORKTREE_ROOT"
+  elif [[ -n "$WT_MAIN_HASH" ]]; then
+    # Borrow the main checkout's sentinel and markers when nothing live is bound
+    # to the worktree path: no sentinel at all (the walk keeps a stale match, so
+    # that means no server was ever bound here), or only a STALE one — a leftover
+    # from an old direct session must not mask the live main server.
+    WT_HELD=$(sentinel_for "$PROJECT_HASH")
+    WT_MAIN_SENTINEL=$(sentinel_for "$WT_MAIN_HASH")
+    WT_BORROW=0
+    if [[ -n "$WT_MAIN_SENTINEL" ]]; then
+      if [[ -z "$WT_HELD" ]]; then
+        WT_BORROW=1
+      elif (( $(date +%s) - $(file_mtime "$WT_HELD") > STALE_THRESHOLD_SEC )) \
+        && (( $(date +%s) - $(file_mtime "$WT_MAIN_SENTINEL") <= STALE_THRESHOLD_SEC )); then
+        WT_BORROW=1
+      fi
+    fi
+    if (( WT_BORROW == 1 )); then
       # Paths stay relative to the worktree (that is where the agent works);
       # the hash — and so every sentinel/marker lookup — is the main checkout's.
       PROJECT_ROOT="$WORKTREE_ROOT"
@@ -709,7 +726,7 @@ worktree_delta_refresh() {
 worktree_delta_has() {
   [[ -n "$WORKTREE_ROOT" ]] || return 1
   local abs="$1" rel
-  [[ "$abs" == /* ]] || abs="$WORKTREE_ROOT/$abs"
+  [[ "$abs" == /* ]] || abs="$(pwd)/$abs"
   case "$abs" in
     "$WORKTREE_ROOT"/*) rel="${abs#"$WORKTREE_ROOT"/}" ;;
     *) return 1 ;;
@@ -1198,13 +1215,6 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
       exit 0
     fi
 
-    # Linked worktree: a file the branch changed is described by the index in its
-    # main-checkout version, so a consultation cannot unlock anything useful —
-    # the file on disk is the source of truth (GH #1481).
-    if worktree_delta_has "$FILE_PATH"; then
-      exit 0
-    fi
-
     # Heartbeat fallback — server is unavailable, allow Read with warning.
     # This is the legitimate fallback path; agents do not control it.
     if (( HEARTBEAT_DEAD == 1 )); then
@@ -1234,6 +1244,14 @@ if [[ "$TOOL_NAME" == "Read" ]]; then
     CONSULTED_HASH=$(file_sha256 "$REL_PATH_FOR_HASH")
     HAS_MARKER=0
     if [[ -n "$PROJECT_HASH" ]] && consulted_marker_exists "$CONSULTED_HASH"; then
+      HAS_MARKER=1
+    fi
+
+    # Linked worktree: a file the branch changed is described by the index in its
+    # main-checkout version, so a consultation cannot unlock anything useful —
+    # the file on disk is the source of truth (GH #1481). Treated like a
+    # consulted file below, so the read ledger and deny state stay accurate.
+    if (( HAS_MARKER == 0 )) && worktree_delta_has "$FILE_PATH"; then
       HAS_MARKER=1
     fi
 

@@ -636,7 +636,9 @@ export function createServer(
   // files the branch changed so answers about them can be flagged. Null (and
   // therefore no behaviour change at all) for a main checkout.
   const worktreeLink = resolveWorktreeLink(projectRoot, deps?.worktreeRoot);
-  const loadWorktreeDelta = worktreeLink ? () => getWorktreeDelta(worktreeLink) : undefined;
+  const loadWorktreeDelta = worktreeLink
+    ? () => getWorktreeDelta(worktreeLink).catch(() => null)
+    : undefined;
 
   // Install tool gate (preset filtering, description overrides, savings/journal wrapping)
   const { _originalTool, registeredToolNames, ungatedToolNames, toolHandlers, deferredTools } =

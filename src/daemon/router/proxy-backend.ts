@@ -1,7 +1,9 @@
+import fs from 'node:fs';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import { logger } from '../../logger.js';
 import { resolveWorktreeAware, worktreeHint } from '../../registry-worktree.js';
+import { findLinkedWorktree } from '../../worktree-delta.js';
 import { resolveDeepestKnownRoot } from '../../subproject/resolve.js';
 import { isTransientError, withRetry } from '../../utils/retry.js';
 import { LOAD_TOOLS_HINT, expandLoadRequest, planToolLoad } from '../../server/tool-surface.js';
@@ -149,6 +151,14 @@ function delay(ms: number): Promise<void> {
     const t = setTimeout(resolve, ms);
     t.unref?.();
   });
+}
+
+function realpathOrSelf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return p;
+  }
 }
 
 /**
@@ -667,6 +677,13 @@ export class ProxyBackend implements Backend {
     // binds to the subproject's own scoped index instead of the container's
     // mixed blob (#209 — "ругается на зонтик").
     const known = await resolveDeepestKnownRoot(this.opts.projectRoot);
+    // A worktree nested inside its main checkout (`<main>/.claude/worktrees/x`)
+    // resolves to the registered main as an ordinary ancestor, never reaching the
+    // worktree branch below — still tell the daemon which worktree this is.
+    const linked = findLinkedWorktree(this.opts.projectRoot);
+    if (known && linked && realpathOrSelf(known) === linked.mainRoot) {
+      this.worktreeHint = linked.worktreeRoot;
+    }
     if (known && known !== this.opts.projectRoot) {
       logger.info(
         { requested: this.opts.projectRoot, resolved: known },
@@ -692,7 +709,9 @@ export class ProxyBackend implements Backend {
         },
         'ProxyBackend: routing worktree to canonical indexed repo',
       );
-      this.worktreeHint = wt.isLinkedWorktree ? this.opts.projectRoot : null;
+      // The toplevel, not the raw cwd: a session started in a subdirectory
+      // must still name the worktree. The daemon validates it.
+      this.worktreeHint = wt.isLinkedWorktree ? (linked?.worktreeRoot ?? null) : null;
       return canonical.root;
     }
     return this.opts.projectRoot;

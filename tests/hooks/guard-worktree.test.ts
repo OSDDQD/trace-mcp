@@ -182,14 +182,73 @@ describe.skipIf(process.platform === 'win32')('trace-mcp-guard.sh in a linked wo
   });
 
   it('does not mistake a submodule-style .git file for a worktree', () => {
-    const sub = path.join(tmp, 'sub');
+    // A submodule's `.git` file points into <super>/.git/modules/<name>, whose
+    // admin dir has no `commondir`. If it were taken for a worktree of <super>,
+    // the live sentinel of <super> would be borrowed and the Read denied.
+    const superproject = path.join(tmp, 'super');
+    // Not under the superproject, so the walk-up cannot reach its sentinel.
+    const sub = path.join(tmp, 'sub-checkout');
+    const admin = path.join(superproject, '.git', 'modules', 'sub');
+    fs.mkdirSync(admin, { recursive: true });
     fs.mkdirSync(path.join(sub, 'src'), { recursive: true });
-    const admin = path.join(tmp, 'admin');
-    fs.mkdirSync(admin);
     fs.writeFileSync(path.join(sub, '.git'), `gitdir: ${admin}\n`);
     fs.writeFileSync(path.join(sub, 'src/x.ts'), 'export const x = 1;\n');
-    heartbeat(sub);
+    heartbeat(superproject);
     const d = runGuard('Read', { file_path: path.join(sub, 'src/x.ts') }, sessionId, sub);
+    // Nothing is bound to `sub` itself, so the guard falls back (not borrowed).
+    expect(d.allowed).toBe(true);
+    expect(d.context).toContain('not running');
+  });
+
+  it('keeps routing once the stale sentinel of the worktree path is passed over', () => {
+    // A leftover sentinel from an old direct session must not mask the live
+    // main server (which would switch strict routing off for the session).
+    const stale = path.join(TMP_BASE, `trace-mcp-alive-${projectHash(wt)}`);
+    fs.writeFileSync(stale, 'old');
+    files.push(stale);
+    const past = new Date(Date.now() - 120_000);
+    fs.utimesSync(stale, past, past);
+    const d = runGuard('Read', { file_path: path.join(wt, 'src/b.ts') }, sessionId, wt);
     expect(d.allowed).toBe(false);
+    expect(d.reason).toContain('get_outline');
+  });
+
+  it('counts repeated full Reads of a changed file against the read limit', () => {
+    const a = path.join(wt, 'src/a.ts');
+    for (let i = 0; i < 3; i++) {
+      expect(runGuard('Read', { file_path: a }, sessionId, wt).allowed).toBe(true);
+    }
+    const d = runGuard('Read', { file_path: a }, sessionId, wt);
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toContain('Already read');
+  });
+
+  it('resolves a relative path against the hook cwd, not the worktree root', () => {
+    const cwd = path.join(wt, 'src');
+    expect(runGuard('Read', { file_path: 'a.ts' }, sessionId, cwd).allowed).toBe(true);
+  });
+
+  describe('worktree nested inside the main checkout', () => {
+    let nested: string;
+    beforeEach(() => {
+      nested = path.join(main, '.claude', 'worktrees', 'inner');
+      git(main, 'worktree', 'add', '-q', '-b', 'inner', nested);
+      fs.writeFileSync(path.join(nested, 'src/a.ts'), 'export const a = 3;\n');
+    });
+
+    it('honours a consultation keyed relative to the worktree', () => {
+      consulted(main, 'src/b.ts');
+      expect(
+        runGuard('Read', { file_path: path.join(nested, 'src/b.ts') }, sessionId, nested).allowed,
+      ).toBe(true);
+    });
+
+    it('still gates an unconsulted unchanged file and frees a changed one', () => {
+      const b = runGuard('Read', { file_path: path.join(nested, 'src/b.ts') }, sessionId, nested);
+      expect(b.allowed).toBe(false);
+      expect(
+        runGuard('Read', { file_path: path.join(nested, 'src/a.ts') }, sessionId, nested).allowed,
+      ).toBe(true);
+    });
   });
 });

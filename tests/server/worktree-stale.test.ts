@@ -80,6 +80,11 @@ describe('markStaleOnBranch', () => {
     expect(payload).not.toHaveProperty('stale_on_branch');
   });
 
+  it('reads camelCase list keys too', () => {
+    const payload = { changedFiles: ['src/a.ts'], filePaths: ['src/gone.ts'] };
+    expect(markStaleOnBranch(payload, delta())).toEqual(['src/a.ts', 'src/gone.ts']);
+  });
+
   it('does nothing for an empty delta or an unrelated payload', () => {
     const payload = { file: 'src/a.ts' };
     expect(markStaleOnBranch(payload, delta({ modified: [], deleted: [], untracked: [] }))).toEqual(
@@ -240,6 +245,19 @@ describe.skipIf(process.platform === 'win32')('worktree session over MCP', () =>
     expect(worktree.canonical_root).toBe(main);
     expect(worktree.modified).toEqual(['src/a.ts']);
     expect(worktree.total).toBe(1);
+  });
+
+  it('resolves a session rooted in a worktree subdirectory', async () => {
+    fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+    const { call } = await connect(path.join(wt, 'src'));
+    const { json } = await call('get_index_health');
+    expect((json.worktree as Json).worktree_root).toBe(wt);
+  });
+
+  it('ignores a forwarded hint that does not belong to the session root', async () => {
+    const { call } = await connect(path.join(tmp), { worktreeRoot: wt });
+    const { json } = await call('get_index_health');
+    expect(json).not.toHaveProperty('worktree');
   });
 
   it('serves a canonical session routed from a worktree via the forwarded hint', async () => {

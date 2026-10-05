@@ -113,6 +113,24 @@ describe.skipIf(process.platform === 'win32')('ProxyBackend worktree hint', () =
     expect(url.searchParams.get('worktree')).toBe(linked);
   });
 
+  it('forwards the worktree toplevel when the session starts in a subdirectory', async () => {
+    const { main, linked } = makeMainWithWorktree();
+    fs.mkdirSync(path.join(linked, 'src'));
+    const url = new URL(await startFor(path.join(linked, 'src')));
+    expect(url.searchParams.get('project')).toBe(main);
+    expect(url.searchParams.get('worktree')).toBe(linked);
+  });
+
+  it('forwards the hint for a worktree nested inside the registered main checkout', async () => {
+    const { main } = makeMainWithWorktree();
+    const nested = path.join(main, '.claude', 'worktrees', 'inner');
+    runGit(main, 'worktree', 'add', '-q', '-b', 'inner', nested);
+    const url = new URL(await startFor(nested));
+    // The registered main is an ordinary ancestor of the nested worktree.
+    expect(url.searchParams.get('project')).toBe(main);
+    expect(url.searchParams.get('worktree')).toBe(nested);
+  });
+
   it('sends no worktree hint for a registered main checkout', async () => {
     const { main } = makeMainWithWorktree();
     const url = new URL(await startFor(main));

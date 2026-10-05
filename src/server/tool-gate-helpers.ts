@@ -476,6 +476,9 @@ export function createGatedCallback(
     const telemetrySpan = getGlobalTelemetrySink().startSpan(`tool.${ctx.name}`, {
       'tool.name': ctx.name,
     });
+    // Started before the handler so the git work overlaps it; only a non-error
+    // response waits for it. Resolvers never reject.
+    const worktreeDeltaPending = ctx.getWorktreeDelta?.();
     let result: unknown;
     try {
       result = await originalCb(...cbArgs);
@@ -531,7 +534,8 @@ export function createGatedCallback(
 
     // Only a worktree session has a resolver; everywhere else this stays null
     // and the response is built exactly as before.
-    const worktreeDelta = ctx.getWorktreeDelta ? await ctx.getWorktreeDelta() : null;
+    const worktreeDelta =
+      worktreeDeltaPending && !resultObj?.isError ? await worktreeDeltaPending : null;
     enrichResponse(ctx, resultObj, params, originalParamSnapshot, appliedDefaults, worktreeDelta);
     applyWireFormat(resultObj, effectiveFormat);
 

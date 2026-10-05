@@ -133,7 +133,7 @@ owner's again.
 
 A linked git worktree is served from the main checkout's index, so for every file the
 branch touched the index still holds the main version. trace-mcp computes the
-difference (`git diff --name-only <main HEAD>` run in the worktree, plus untracked
+difference (`git diff --name-status <main HEAD>` run in the worktree, plus untracked
 files, cached for two seconds) and uses it in three places:
 
 - Tool results (including `batch` sub-calls) whose `path` / `file` / `file_path` /

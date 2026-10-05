@@ -14,7 +14,7 @@ import { type WorktreeDelta, worktreeDeltaPaths } from '../worktree-delta.js';
 const PATH_KEYS = ['path', 'file', 'file_path', 'filePath'] as const;
 
 /** List-of-paths keys: cannot carry a flag per item, but still feed the warning. */
-const PATH_LIST_KEY_RE = /^(files|file_paths|[a-z_]*_files)$/;
+const PATH_LIST_KEY_RE = /^(files|file_paths|filePaths|\w*_files|\w*Files)$/;
 
 const MAX_DEPTH = 16;
 /** Files named in the warning; the rest is summarised as a count. */

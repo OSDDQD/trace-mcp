@@ -9,6 +9,7 @@ import {
   getWorktreeDelta,
   parseNameStatusZ,
   resolveWorktreeLink,
+  WORKTREE_DELTA_CACHE_MAX,
   summarizeWorktreeDelta,
   type WorktreeDelta,
   worktreeDeltaPaths,
@@ -68,9 +69,48 @@ describe.skipIf(process.platform === 'win32')('worktree delta', () => {
       expect(resolveWorktreeLink(wt)).toEqual({ worktreeRoot: wt, canonicalRoot: main });
     });
 
+    it('resolves a session rooted in a subdirectory of the worktree to its toplevel', () => {
+      fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+      expect(resolveWorktreeLink(path.join(wt, 'src'))).toEqual({
+        worktreeRoot: wt,
+        canonicalRoot: main,
+      });
+    });
+
+    it('links a worktree nested inside its main checkout', () => {
+      const nested = path.join(main, '.claude', 'worktrees', 'inner');
+      git(main, 'worktree', 'add', '-q', '-b', 'inner', nested);
+      expect(resolveWorktreeLink(nested)).toEqual({ worktreeRoot: nested, canonicalRoot: main });
+      expect(resolveWorktreeLink(main, nested)).toEqual({
+        worktreeRoot: nested,
+        canonicalRoot: main,
+      });
+    });
+
+    it('turns a hint naming a subdirectory into the worktree toplevel', () => {
+      fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+      expect(resolveWorktreeLink(main, path.join(wt, 'src'))).toEqual({
+        worktreeRoot: wt,
+        canonicalRoot: main,
+      });
+    });
+
+    it('ignores a hint whose worktree belongs to a different checkout', () => {
+      const other = path.join(tmp, 'other');
+      fs.mkdirSync(other);
+      git(other, 'init', '-q', '-b', 'main');
+      write(other, 'x.ts', 'export {};\n');
+      git(other, 'add', '-A');
+      git(other, 'commit', '-q', '-m', 'init');
+      const otherWt = path.join(tmp, 'other-wt');
+      git(other, 'worktree', 'add', '-q', '-b', 'f', otherWt);
+      expect(resolveWorktreeLink(main, otherWt)).toBeNull();
+      expect(resolveWorktreeLink(main, path.join(tmp, 'does-not-exist'))).toBeNull();
+    });
+
     it('honours the worktree hint a proxy forwards for a canonical session', () => {
       expect(resolveWorktreeLink(main, wt)).toEqual({ worktreeRoot: wt, canonicalRoot: main });
-      // A hint naming a main checkout (no `.git` file) is not a worktree.
+      // A hint naming a main checkout is not a worktree.
       expect(resolveWorktreeLink(main, main)).toBeNull();
     });
   });
@@ -152,6 +192,32 @@ describe.skipIf(process.platform === 'win32')('worktree delta', () => {
       const link = { worktreeRoot: wt, canonicalRoot: main };
       const [a, b] = await Promise.all([getWorktreeDelta(link), getWorktreeDelta(link)]);
       expect(a).toBe(b);
+    });
+
+    it('evicts the entry with the oldest timestamp, not the first inserted', async () => {
+      const link = (i: number) => ({
+        worktreeRoot: path.join(tmp, `missing-${i}`),
+        canonicalRoot: main,
+      });
+      const t0 = 5_000_000;
+      const huge = 10_000_000;
+      const first = await Promise.resolve(getWorktreeDelta(link(0), { ttlMs: huge, now: t0 }));
+      expect(first).toBeNull();
+      const promises: Array<ReturnType<typeof getWorktreeDelta>> = [];
+      for (let i = 1; i < WORKTREE_DELTA_CACHE_MAX - 1; i++) {
+        promises.push(getWorktreeDelta(link(i), { ttlMs: huge, now: t0 + i }));
+      }
+      await Promise.all(promises);
+      // Refresh key 0 while the cache is not yet full: it keeps the first Map
+      // slot but is now the newest entry.
+      const later = t0 + 100_000;
+      const refreshed = getWorktreeDelta(link(0), { ttlMs: 1_000, now: later });
+      await refreshed;
+      await getWorktreeDelta(link(WORKTREE_DELTA_CACHE_MAX - 1), { ttlMs: huge, now: later });
+      // The cache is full: this insert evicts. The oldest timestamp is key 1's.
+      await getWorktreeDelta(link(WORKTREE_DELTA_CACHE_MAX), { ttlMs: huge, now: later });
+      expect(getWorktreeDelta(link(0), { ttlMs: huge, now: later })).toBe(refreshed);
+      expect(getWorktreeDelta(link(1), { ttlMs: huge, now: later })).not.toBe(promises[0]);
     });
 
     it('never rejects', async () => {
