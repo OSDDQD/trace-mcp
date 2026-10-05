@@ -101,3 +101,38 @@ export async function dispatchIndexFile(
     throw e;
   }
 }
+
+/** EX_TEMPFAIL from sysexits.h: not done, worth retrying. */
+export const EXIT_TEMPFAIL = 75;
+
+/**
+ * What `index-file` tells its caller. The two outcomes where nothing was
+ * indexed by this process say so on stderr — the PostToolUse hook spawns the
+ * command detached with all output discarded and never reads the exit code,
+ * so this is for a person or script running it directly.
+ *
+ * - `daemon-timeout` exits 0: the daemon has the request and runs it.
+ * - `lock-busy` exits 75 (EX_TEMPFAIL): this process did not index the file
+ *   and cannot tell whether the lock holder will, so a caller that cares
+ *   should retry.
+ */
+export function describeIndexFileOutcome(
+  outcome: IndexFileOutcome,
+  file: string,
+  projectRoot: string,
+): { exitCode: number; message?: string } {
+  switch (outcome) {
+    case 'daemon-timeout':
+      return {
+        exitCode: 0,
+        message: `trace-mcp index-file: daemon did not answer in time; leaving ${file} to the daemon`,
+      };
+    case 'lock-busy':
+      return {
+        exitCode: EXIT_TEMPFAIL,
+        message: `trace-mcp index-file: reindex lock for ${projectRoot} is held by another process; ${file} was not indexed`,
+      };
+    default:
+      return { exitCode: 0 };
+  }
+}

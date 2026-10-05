@@ -91,7 +91,7 @@ import type { TraceMcpConfig } from './config.js';
 import { loadConfig, loadGlobalConfigRaw, validateConfigUpdate } from './config.js';
 import { saveGlobalSettingsJsonc } from './config-jsonc.js';
 import { isDaemonRunning } from './daemon/client.js';
-import { dispatchIndexFile } from './cli/index-file.js';
+import { describeIndexFileOutcome, dispatchIndexFile } from './cli/index-file.js';
 import { buildHealthPayload, withMissingRoots } from './daemon/health-payload.js';
 import { buildApiProjectsList } from './daemon/api-projects-payload.js';
 import { DaemonIdleMonitor } from './daemon/idle-monitor.js';
@@ -4475,7 +4475,11 @@ program
   .command('index-file')
   .description('Incrementally reindex a single file (called by the PostToolUse auto-reindex hook)')
   .argument('<file>', 'Absolute or relative path to the file to reindex')
-  .action(async (file: string) => {
+  .option(
+    '--wait',
+    'Wait for a running daemon to finish the reindex instead of returning once it is queued (benchmarks)',
+  )
+  .action(async (file: string, opts: { wait?: boolean }) => {
     const resolvedFile = path.resolve(file);
     if (!fs.existsSync(resolvedFile)) {
       process.exit(0); // file may have been deleted — exit silently
@@ -4491,12 +4495,17 @@ program
     const outcome = await dispatchIndexFile(resolvedFile, projectRoot, {
       daemonRunning: () => isDaemonRunning(DEFAULT_DAEMON_PORT),
       postToDaemon: () =>
-        fetch(`http://127.0.0.1:${DEFAULT_DAEMON_PORT}/api/projects/reindex-file`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ project: projectRoot, path: resolvedFile }),
-          signal: AbortSignal.timeout(2000),
-        }),
+        fetch(
+          `http://127.0.0.1:${DEFAULT_DAEMON_PORT}/api/projects/reindex-file${opts.wait ? '?wait=1' : ''}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project: projectRoot, path: resolvedFile }),
+            // A queued request is answered in milliseconds; --wait covers the
+            // whole reindex, which takes seconds on a large project.
+            signal: AbortSignal.timeout(opts.wait ? 120_000 : 2000),
+          },
+        ),
       // Same spelling the daemon keys its reindex lock by (TRA-2032 aliases).
       lockRoot: getProject(projectRoot)?.root ?? projectRoot,
       indexLocally: async () => {
@@ -4520,7 +4529,10 @@ program
         }
       },
     });
-    if (outcome !== 'local') process.exit(0);
+    const { exitCode, message } = describeIndexFileOutcome(outcome, resolvedFile, projectRoot);
+    if (message) process.stderr.write(`${message}\n`);
+    // Local indexing ends by itself once the pipeline is disposed.
+    if (outcome !== 'local') process.exit(exitCode);
   });
 
 program

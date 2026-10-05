@@ -15,6 +15,7 @@ vi.mock('../../src/logger.js', () => ({
 import {
   acceptReindexFile,
   clearProjectStopping,
+  handleReindexFile,
   isReindexing,
   markProjectStopping,
 } from '../../src/daemon/reindex-file-handler.js';
@@ -41,9 +42,11 @@ const busy = (): LockError =>
   new LockError('Lock held', {
     pid: process.pid,
     hostname: os.hostname(),
-    op: 'register_edit',
+    op: 'reindex',
     started_at: Date.now(),
   });
+
+const passThroughLock = () => vi.fn(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
 
 async function drained(project: string): Promise<void> {
   await vi.waitFor(() => expect(isReindexing(project)).toBe(false), { timeout: 5_000 });
@@ -57,34 +60,38 @@ describe('acceptReindexFile (#1480)', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it('answers before indexing finishes and holds the in-flight mark until it does', async () => {
+  it('answers before any indexing work starts and holds the in-flight mark until it ends', async () => {
     const project = '/tmp/proj-1480-ack';
     const gate = deferred();
     const indexFiles = vi.fn(async (_paths: string[]) => {
       await gate.promise;
-      return { indexed: 1, skipped: 0, errors: 0, durationMs: 5 };
+      return { totalFiles: 1, indexed: 1, skipped: 0, errors: 0, durationMs: 5 };
     });
     const getProject = vi.fn((root: string) =>
       root === project ? { pipeline: { indexFiles }, status: 'ready' as const } : undefined,
     );
-    const lock = vi.fn(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
+    const lock = passThroughLock();
 
-    // Synchronous return: the route can write 202 without awaiting the work.
     const result = acceptReindexFile(
       { project, path: 'src/a.ts' },
       // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
       { getProject, lock: lock as any },
     );
     expect(result).toEqual({ ok: true, relPath: 'src/a.ts', queued: true });
-    // stopProject() drains on this mark; it must be up before the 202 goes out.
+    // Nothing that costs time (lock acquire + fsync, path filtering) may run
+    // before the route writes its 202 — only the in-flight mark, which
+    // stopProject() drains on.
+    expect(lock).not.toHaveBeenCalled();
     expect(isReindexing(project)).toBe(true);
 
-    await vi.waitFor(() => expect(indexFiles).toHaveBeenCalledWith(['src/a.ts']));
-    const lockOpts = lock.mock.calls[0][0] as { name: string };
-    expect(lockOpts.name).toMatch(/-reindex$/);
+    await vi.waitFor(() =>
+      expect(indexFiles).toHaveBeenCalledWith(['src/a.ts'], expect.anything()),
+    );
+    expect((lock.mock.calls[0][0] as { name: string }).name).toMatch(/-reindex$/);
     expect(isReindexing(project)).toBe(true);
 
     gate.resolve();
@@ -92,20 +99,26 @@ describe('acceptReindexFile (#1480)', () => {
     expect(getReindexStats().summarize().indexed).toBe(1);
   });
 
-  it('batches files that arrive while a run is in flight into one follow-up run', async () => {
+  it('batches files that arrive during a run and reports one event per file', async () => {
     const project = '/tmp/proj-1480-batch';
     const gate = deferred();
     const indexFiles = vi
-      .fn(async (_paths: string[]) => undefined)
+      .fn(async (paths: string[]) => ({
+        totalFiles: paths.length,
+        indexed: paths.length,
+        skipped: 0,
+        errors: 0,
+        durationMs: 7,
+      }))
       .mockImplementationOnce(async () => {
         await gate.promise;
+        return { totalFiles: 1, indexed: 1, skipped: 0, errors: 0, durationMs: 7 };
       });
     const getProject = vi.fn((root: string) =>
       root === project ? { pipeline: { indexFiles } } : undefined,
     );
-    const lock = vi.fn(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
     // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
-    const deps = { getProject, lock: lock as any };
+    const deps = { getProject, lock: passThroughLock() as any };
 
     acceptReindexFile({ project, path: 'src/a.ts' }, deps);
     await vi.waitFor(() => expect(indexFiles).toHaveBeenCalledTimes(1));
@@ -118,63 +131,58 @@ describe('acceptReindexFile (#1480)', () => {
       ['src/a.ts'],
       ['src/b.ts', 'src/c.ts'],
     ]);
+    const events = getReindexStats().snapshot();
+    expect(events).toHaveLength(3);
+    // Each file reports the batch's work, not N times it.
+    expect(events.map((e) => e.elapsedMs)).toEqual([7, 7, 7]);
+    expect(getReindexStats().summarize().indexed).toBe(3);
   });
 
-  it('retries a busy reindex lock instead of dropping the edit', async () => {
-    const project = '/tmp/proj-1480-retry';
+  it('keeps waiting while the lock holder is alive, past any fixed deadline', async () => {
+    // The `reindex` tool holds the same lock for a whole indexAll — minutes on
+    // a large project. The request was already answered 2xx, so dropping it
+    // would leave the edit out of the index until the next one.
+    vi.useFakeTimers({
+      toFake: [
+        'setTimeout',
+        'clearTimeout',
+        'setImmediate',
+        'clearImmediate',
+        'performance',
+        'Date',
+      ],
+    });
+    const project = '/tmp/proj-1480-long-holder';
     const indexFiles = vi.fn(async (_paths: string[]) => undefined);
     const getProject = vi.fn((root: string) =>
       root === project ? { pipeline: { indexFiles } } : undefined,
     );
-    let attempts = 0;
+    let holderDone = false;
     const lock = vi.fn(async (_opts: unknown, fn: () => Promise<unknown>) => {
-      attempts++;
-      if (attempts <= 2) throw busy();
+      if (!holderDone) throw busy();
       return fn();
     });
 
     acceptReindexFile(
       { project, path: 'src/a.ts' },
       // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
-      { getProject, lock: lock as any, queueRetry: { delayMs: 1, deadlineMs: 5_000 } },
+      { getProject, lock: lock as any },
     );
-    await drained(project);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(indexFiles).not.toHaveBeenCalled();
+    expect(isReindexing(project)).toBe(true);
+    // One "still waiting" warn, not one per attempt.
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect((logger.warn as ReturnType<typeof vi.fn>).mock.calls[0][1]).toMatch(/still waiting/);
 
-    expect(lock).toHaveBeenCalledTimes(3);
-    expect(indexFiles).toHaveBeenCalledWith(['src/a.ts']);
-    expect(logger.warn).not.toHaveBeenCalled();
+    holderDone = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(indexFiles).toHaveBeenCalledWith(['src/a.ts'], expect.anything());
+    expect(isReindexing(project)).toBe(false);
     expect(getReindexStats().summarize().errors).toBe(0);
   });
 
-  it('drops the batch with a warn and an error record once the retry deadline passes', async () => {
-    const project = '/tmp/proj-1480-deadline';
-    const indexFiles = vi.fn(async (_paths: string[]) => undefined);
-    const getProject = vi.fn((root: string) =>
-      root === project ? { pipeline: { indexFiles } } : undefined,
-    );
-    const lock = vi.fn(async () => {
-      throw busy();
-    });
-
-    acceptReindexFile(
-      { project, path: 'src/a.ts' },
-      // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
-      { getProject, lock: lock as any, queueRetry: { delayMs: 1, deadlineMs: 20 } },
-    );
-    await drained(project);
-
-    expect(indexFiles).not.toHaveBeenCalled();
-    expect(logger.warn).toHaveBeenCalledTimes(1);
-    const [meta, msg] = (logger.warn as ReturnType<typeof vi.fn>).mock.calls[0] as [
-      Record<string, unknown>,
-      string,
-    ];
-    expect(msg).toMatch(/retry deadline/);
-    expect(meta.lockBusy).toBe(true);
-    expect(getReindexStats().summarize().errors).toBe(1);
-  });
-
-  it('does not run a queued batch against a project that started stopping', async () => {
+  it('a batch dropped for a stopping project is recorded and does not dedup the next reindex', async () => {
     const project = '/tmp/proj-1480-stopping';
     const indexFiles = vi.fn(async (_paths: string[]) => undefined);
     const getProject = vi.fn((root: string) =>
@@ -190,7 +198,7 @@ describe('acceptReindexFile (#1480)', () => {
       acceptReindexFile(
         { project, path: 'src/a.ts' },
         // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
-        { getProject, lock: lock as any, queueRetry: { delayMs: 1, deadlineMs: 5_000 } },
+        { getProject, lock: lock as any, queueRetry: { delayMs: 1 } },
       );
       await drained(project);
     } finally {
@@ -199,5 +207,38 @@ describe('acceptReindexFile (#1480)', () => {
 
     expect(lock).toHaveBeenCalledTimes(1);
     expect(indexFiles).not.toHaveBeenCalled();
+    const [dropped] = getReindexStats().snapshot();
+    expect(dropped.error).toBe(true);
+    // No indexing work ran — the wait goes to queuedMs, not the work percentiles.
+    expect(dropped.elapsedMs).toBe(0);
+
+    // The file was marked "just reindexed" when accepted; it never was.
+    const again = await handleReindexFile(
+      { project, path: 'src/a.ts' },
+      // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
+      { getProject, lock: passThroughLock() as any },
+    );
+    expect(again).toEqual({ ok: true, relPath: 'src/a.ts' });
+    expect(indexFiles).toHaveBeenCalledWith(['src/a.ts']);
+  });
+
+  it('passes the project abort signal so stopProject() can stop a running batch', async () => {
+    const project = '/tmp/proj-1480-abort';
+    const indexAbortController = new AbortController();
+    const indexFiles = vi.fn(
+      async (_paths: string[], _opts?: { signal?: AbortSignal }) => undefined,
+    );
+    const getProject = vi.fn((root: string) =>
+      root === project ? { pipeline: { indexFiles }, indexAbortController } : undefined,
+    );
+
+    acceptReindexFile(
+      { project, path: 'src/a.ts' },
+      // biome-ignore lint/suspicious/noExplicitAny: test fake lock signature
+      { getProject, lock: passThroughLock() as any },
+    );
+    await drained(project);
+
+    expect(indexFiles.mock.calls[0][1]?.signal).toBe(indexAbortController.signal);
   });
 });

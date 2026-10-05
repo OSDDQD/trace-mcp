@@ -40,10 +40,14 @@
 #     ~2.4 s, so nearly every edit hit `--max-time 2`, was classified
 #     `no-daemon`, and spawned a cold `trace-mcp index-file` for a file the
 #     daemon was already indexing.
-#   - A curl timeout AFTER the TCP connect succeeded (exit 28 with a non-zero
-#     `time_connect`) means the daemon has the request; it is recorded as
+#   - A curl timeout AFTER the TCP connect succeeded (exit 28 with
+#     `num_connects` >= 1) means the daemon has the request; it is recorded as
 #     `daemon`/`timeout` and no CLI fallback is spawned. A refused or timed
-#     out connect is still `no-daemon`.
+#     out connect is still `no-daemon`, and so is a daemon that died mid
+#     request (SIGKILL closes the socket: curl exits 52/56, not 28). The
+#     connect test is `num_connects`, not `time_connect`: curl before 7.61
+#     prints time_connect with three decimals, so a localhost connect reads
+#     as 0.000.
 
 set -euo pipefail
 
@@ -209,18 +213,18 @@ dispatch() {
   START_MS=$(now_ms)
 
   # Try daemon first — single curl, ~5 ms RTT. No Node startup.
-  # `-w '%{http_code} %{time_connect}'` yields "000" on any pre-HTTP failure
-  # (refused, timeout, DNS) and a time_connect of 0 when the TCP connect never
+  # `-w '%{http_code} %{num_connects}'` yields "000" on any pre-HTTP failure
+  # (refused, timeout, DNS) and num_connects 0 when the TCP connect never
   # completed. The printed code is the main signal and `|| echo` here corrupts
   # it (see v0.5); the exit status only tells a timeout apart (see v0.7).
-  local CURL_OUT CURL_RC CONNECT_S
-  CURL_OUT=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code} %{time_connect}' -X POST \
+  local CURL_OUT CURL_RC CONNECTS
+  CURL_OUT=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code} %{num_connects}' -X POST \
       -H 'Content-Type: application/json' \
       -d "$(jq -n --arg p "$PROJECT_ROOT" --arg f "$FILE_PATH" '{project:$p,path:$f}')" \
       "http://127.0.0.1:${PORT}/api/projects/reindex-file" 2>/dev/null) && CURL_RC=0 || CURL_RC=$?
   HTTP_CODE="${CURL_OUT%% *}"
-  CONNECT_S=""
-  [[ "$CURL_OUT" == *" "* ]] && CONNECT_S="${CURL_OUT#* }"
+  CONNECTS=""
+  [[ "$CURL_OUT" == *" "* ]] && CONNECTS="${CURL_OUT#* }"
   # Empty means curl is missing or died before writing anything — same
   # observable state as a refused connection.
   [[ -z "$HTTP_CODE" ]] && HTTP_CODE="000"
@@ -236,7 +240,7 @@ dispatch() {
   # v0.7 (#1480): timed out (curl exit 28) after the connect succeeded — the
   # daemon has the request and will run it. A cold `index-file` here would
   # only index the same file a second time.
-  if [[ "$CURL_RC" == "28" && "$CONNECT_S" =~ ^[0-9.]+$ && "$CONNECT_S" =~ [1-9] ]]; then
+  if [[ "$CURL_RC" == "28" && "$CONNECTS" =~ ^[0-9]+$ && "$CONNECTS" -ge 1 ]]; then
     write_stat "daemon" "timeout" "$WALL_MS" "$END_MS" "$PROJECT_ROOT"
     return 0
   fi

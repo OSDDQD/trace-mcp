@@ -14,7 +14,11 @@ vi.mock('../../src/logger.js', () => ({
   },
 }));
 
-import { dispatchIndexFile } from '../../src/cli/index-file.js';
+import {
+  describeIndexFileOutcome,
+  dispatchIndexFile,
+  EXIT_TEMPFAIL,
+} from '../../src/cli/index-file.js';
 import { projectHash } from '../../src/global.js';
 import { acquireLock, releaseLock } from '../../src/utils/pid-lock.js';
 
@@ -104,5 +108,18 @@ describe('dispatchIndexFile (#1480)', () => {
     } finally {
       releaseLock(held);
     }
+  });
+
+  it('reports the not-indexed-here outcomes on stderr, with a retryable code for lock-busy', () => {
+    expect(describeIndexFileOutcome('lock-busy', FILE, ROOT)).toEqual({
+      exitCode: EXIT_TEMPFAIL,
+      message: expect.stringContaining('was not indexed'),
+    });
+    expect(describeIndexFileOutcome('daemon-timeout', FILE, ROOT)).toEqual({
+      exitCode: 0,
+      message: expect.stringContaining('leaving /proj/src/a.ts to the daemon'),
+    });
+    expect(describeIndexFileOutcome('local', FILE, ROOT)).toEqual({ exitCode: 0 });
+    expect(describeIndexFileOutcome('daemon', FILE, ROOT)).toEqual({ exitCode: 0 });
   });
 });
