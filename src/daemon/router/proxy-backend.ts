@@ -179,6 +179,13 @@ export class ProxyBackend implements Backend {
 
   /** Resolved once in start(); reused when re-establishing a dead session. */
   private projectRoot: string | null = null;
+  /**
+   * Set when a linked worktree was routed to its canonical project: the daemon
+   * session then binds to the canonical root, so the worktree path travels as
+   * a `?worktree=` hint to let the session flag results for files the branch
+   * changed. Null when the session is not a routed worktree.
+   */
+  private worktreeHint: string | null = null;
   /** The client's initialize frame, cached so we can replay it after a daemon restart. */
   private initializeFrame: (JSONRPCMessage & { id: string | number }) | null = null;
   /** Single-flight guard so concurrent failed sends share one recovery. */
@@ -638,7 +645,8 @@ export class ProxyBackend implements Backend {
    * `/mcp` directly send no such marker and keep the daemon's preset.
    */
   private mcpUrl(projectRoot: string): string {
-    const base = `${this.opts.daemonUrl}/mcp?project=${encodeURIComponent(projectRoot)}`;
+    const worktree = this.worktreeHint ? `&worktree=${encodeURIComponent(this.worktreeHint)}` : '';
+    const base = `${this.opts.daemonUrl}/mcp?project=${encodeURIComponent(projectRoot)}${worktree}`;
     if (!this.opts.toolFilter) return base;
     // `preset` travels too: the daemon registers everything, but it still
     // writes this session's instructions block and usage ping, and both are
@@ -684,6 +692,7 @@ export class ProxyBackend implements Backend {
         },
         'ProxyBackend: routing worktree to canonical indexed repo',
       );
+      this.worktreeHint = wt.isLinkedWorktree ? this.opts.projectRoot : null;
       return canonical.root;
     }
     return this.opts.projectRoot;
